@@ -44,13 +44,14 @@ class TensorCoreFP8Layout(QuantizedLayout):
     def quantize(
         cls,
         tensor: torch.Tensor,
-        scale: torch.Tensor | float | None = None,
+        scale: torch.Tensor | float | str | None = None,
         dtype: torch.dtype = torch.float8_e4m3fn,
+        **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
 
-        if scale is None:
+        if scale is None or scale == "recalculate":
             scale = torch.amax(tensor.abs()) / torch.finfo(dtype).max
 
         if not isinstance(scale, torch.Tensor):
@@ -68,6 +69,14 @@ class TensorCoreFP8Layout(QuantizedLayout):
     @classmethod
     def get_plain_tensors(cls, qtensor: QuantizedTensor) -> tuple[torch.Tensor, torch.Tensor]:
         return qtensor._qdata, qtensor._params.scale
+
+    @classmethod
+    def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
+        """Return key suffix → tensor mapping for serialization."""
+        return {
+            "": qdata,
+            "_scale": params.scale,
+        }
 
 
 # ==================== Helper Utilities ====================

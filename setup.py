@@ -289,8 +289,12 @@ def get_cmdclass(has_extensions):
         class CUDABdistWheel(bdist_wheel):
             def finalize_options(self):
                 super().finalize_options()
-                # Add CUDA version as local version identifier (e.g., 0.1.0+cu128)
                 if not BUILD_NO_CUDA:
+                    # Set stable ABI tag: cp312-abi3 instead of cp312-cp312
+                    # This indicates the extension uses Python's Limited API
+                    self.py_limited_api = "cp312"
+
+                    # Add CUDA version as local version identifier (e.g., 0.1.0+cu128)
                     cuda_version = get_cuda_version()
                     if cuda_version and self.distribution.metadata.version:
                         cuda_tag = f"cu{cuda_version[0]}{cuda_version[1]}"
@@ -343,9 +347,9 @@ if BUILD_NO_CUDA:
 
     setup_kwargs.update({
         "packages": get_packages(),
-        "name": "comfy-kitchen-no-cuda",
+        "name": "comfy-kitchen",
         "version": version,
-        "description": f"{description} (CPU-only, no CUDA)",
+        "description": f"{description} (CPU-only)",
         "include_package_data": False,
         "install_requires": [
             "torch>=2.5.0",

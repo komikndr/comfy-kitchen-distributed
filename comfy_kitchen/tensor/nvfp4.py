@@ -48,7 +48,8 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
     def quantize(
         cls,
         tensor: torch.Tensor,
-        scale: torch.Tensor | float | None = None,
+        scale: torch.Tensor | float | str | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, Params]:
         if tensor.dim() != 2:
             raise ValueError(f"NVFP4 requires 2D tensor, got {tensor.dim()}D")
@@ -56,7 +57,7 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
         orig_dtype = tensor.dtype
         orig_shape = tuple(tensor.shape)
 
-        if scale is None:
+        if scale is None or scale == "recalculate":
             scale = torch.amax(tensor.abs()) / (F8_E4M3_MAX * F4_E2M1_MAX)
 
         if not isinstance(scale, torch.Tensor):
@@ -85,6 +86,15 @@ class TensorCoreNVFP4Layout(QuantizedLayout):
         cls, qtensor: QuantizedTensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return qtensor._qdata, qtensor._params.scale, qtensor._params.block_scale
+
+    @classmethod
+    def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
+        """Return key suffix → tensor mapping for serialization."""
+        return {
+            "": qdata,
+            "_scale": params.block_scale,
+            "_scale_2": params.scale,
+        }
 
     @classmethod
     def get_padded_shape(cls, orig_shape: tuple[int, ...]) -> tuple[int, ...]:

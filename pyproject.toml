@@ -23,7 +23,6 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.5.0",
-    "cuda-core[cu13]>=0.3.2,<1.0",
     "nvidia-cublas>=13.0.0",
 ]
 

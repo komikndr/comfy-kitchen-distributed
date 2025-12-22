@@ -4,8 +4,14 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   build_wheels:
@@ -252,4 +258,25 @@ jobs:
           # Run all tests - conftest handles backend availability
           # Tests requiring CUDA will be skipped on CPU-only runners
           python -m pytest tests/ -v --tb=short
+
+  publish:
+    name: Publish to PyPI
+    needs: [build_wheels, test]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist/
+          merge-multiple: true
+
+      - name: List wheels to publish
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
 

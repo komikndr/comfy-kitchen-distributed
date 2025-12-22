@@ -1,6 +1,7 @@
 """Base classes for quantized tensors with typed layout parameters."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
 from abc import ABC, abstractmethod
@@ -88,6 +89,11 @@ class QuantizedLayout(ABC):
     @classmethod
     @abstractmethod
     def get_plain_tensors(cls, qtensor: QuantizedTensor) -> tuple[torch.Tensor, ...]:
+        raise NotImplementedError
+
+    @classmethod
+    @abstractmethod
+    def state_dict_tensors(cls, qdata: torch.Tensor, params: Any) -> dict[str, torch.Tensor]:
         raise NotImplementedError
 
     @classmethod
@@ -263,6 +269,10 @@ class QuantizedTensor(torch.Tensor):
             return full[slices]
         return full
 
+    def state_dict(self, prefix: str = "") -> dict[str, torch.Tensor]:
+        tensors = self._layout_cls.state_dict_tensors(self._qdata, self._params)
+        return {f"{prefix}{suffix}": tensor for suffix, tensor in tensors.items()}
+
     # ==================== Flatten/Unflatten Protocol ====================
 
     def __tensor_flatten__(self):
@@ -344,6 +354,23 @@ def dequantize_args(args):
 
 # ==================== Dispatch Handlers ====================
 
+def _parse_to_args(args, kwargs):
+    """Extract device and dtype from .to() arguments."""
+    device = kwargs.get("device")
+    dtype = kwargs.get("dtype")
+    for arg in args[1:]:
+        if isinstance(arg, torch.device):
+            device = arg
+        elif isinstance(arg, torch.dtype):
+            dtype = arg
+        elif isinstance(arg, str):
+            with contextlib.suppress(Exception):
+                device = torch.device(arg)
+    if isinstance(device, str):
+        device = torch.device(device)
+    return device, dtype
+
+
 def _handle_detach(qt, args, kwargs):
     return qt._copy_with(qdata=qt._qdata.detach())
 
@@ -352,27 +379,30 @@ def _handle_clone(qt, args, kwargs):
     return qt._copy_with(qdata=qt._qdata.clone())
 
 
-def _handle_to(qt, args, kwargs):
-    """Unified handler for device/dtype changes."""
-    target_device = kwargs.get("device")
-    target_dtype = kwargs.get("dtype")
-
-    if isinstance(target_device, str):
-        target_device = torch.device(target_device)
+def _handle_to(qt, args, kwargs, force_copy=False):
+    target_device, target_dtype = _parse_to_args(args, kwargs)
 
     needs_device = target_device is not None and target_device != qt._qdata.device
     needs_dtype = target_dtype is not None and target_dtype != qt._params.orig_dtype
 
-    if not needs_device and not needs_dtype:
+    if not needs_device and not needs_dtype and not force_copy:
         return qt
 
-    new_qdata = qt._qdata.to(device=target_device) if needs_device else qt._qdata
-    new_params = qt._params.clone()
     if needs_device:
-        new_params = new_params.to_device(target_device)
+        new_qdata = qt._qdata.to(device=target_device)
+        new_params = qt._params.to_device(target_device)
+    else:
+        new_qdata = qt._qdata.clone() if force_copy else qt._qdata
+        new_params = qt._params.clone()
+
     if needs_dtype:
         new_params.orig_dtype = target_dtype
+
     return qt._copy_with(qdata=new_qdata, params=new_params, clone_params=False)
+
+
+def _handle_to_copy(qt, args, kwargs):
+    return _handle_to(qt, args, kwargs, force_copy=True)
 
 
 def _handle_contiguous(qt, args, kwargs):
@@ -386,53 +416,46 @@ def _handle_is_contiguous(qt, args, kwargs):
 
 
 def _handle_copy_(qt, args, kwargs):
-    """Handle in-place copy between QuantizedTensors.
-
-    Raises:
-        TypeError: If src is not a QuantizedTensor or layouts don't match.
-    """
     dst, src = args[0], args[1]
-    non_blocking = kwargs.get("non_blocking", False)
-    if len(args) >= 3:
-        non_blocking = True
     if not isinstance(src, QuantizedTensor):
-        raise TypeError(
-            f"Cannot copy {type(src).__name__} to QuantizedTensor. "
-            "Use QuantizedTensor.from_float() to create a new quantized tensor."
-        )
+        raise TypeError(f"Cannot copy {type(src).__name__} to QuantizedTensor")
     if dst._layout_cls != src._layout_cls:
-        raise TypeError(
-            f"Cannot copy between different layouts: "
-            f"{dst._layout_cls.__name__} vs {src._layout_cls.__name__}"
-        )
+        raise TypeError(f"Layout mismatch: {dst._layout_cls.__name__} vs {src._layout_cls.__name__}")
+
+    dst_orig_dtype = dst._params.orig_dtype
+    non_blocking = kwargs.get("non_blocking", len(args) >= 3)
+
     dst._qdata.copy_(src._qdata, non_blocking=non_blocking)
     dst._params.copy_from(src._params, non_blocking=non_blocking)
+    dst._params.orig_dtype = dst_orig_dtype
     return dst
 
 
 def _handle_empty_like(qt, args, kwargs):
-    new_qdata = torch.empty_like(qt._qdata, **kwargs)
+    target_dtype = kwargs.pop("dtype", None)
+    target_device = kwargs.get("device")
+
+    new_qdata = torch.empty_like(qt._qdata, device=target_device)
     new_params = qt._params.clone()
-    if "device" in kwargs:
-        new_params = new_params.to_device(kwargs["device"])
+
+    if target_device is not None:
+        new_params = new_params.to_device(target_device)
+    if target_dtype is not None:
+        new_params.orig_dtype = target_dtype
+
     return qt._copy_with(qdata=new_qdata, params=new_params, clone_params=False)
-
-
-def _handle_has_compatible_shallow_copy_type(qt, args, kwargs):
-    """QuantizedTensors support shallow copy compatibility."""
-    return True
 
 
 _DISPATCH_TABLE = {
     torch.ops.aten.detach.default: _handle_detach,
     torch.ops.aten.clone.default: _handle_clone,
-    torch.ops.aten._to_copy.default: _handle_to,
+    torch.ops.aten._to_copy.default: _handle_to_copy,
     torch.ops.aten.to.dtype_layout: _handle_to,
     torch.ops.aten.contiguous.default: _handle_contiguous,
     torch.ops.aten.is_contiguous.default: _handle_is_contiguous,
     torch.ops.aten.copy_.default: _handle_copy_,
     torch.ops.aten.empty_like.default: _handle_empty_like,
-    torch.ops.aten._has_compatible_shallow_copy_type.default: _handle_has_compatible_shallow_copy_type,
+    torch.ops.aten._has_compatible_shallow_copy_type.default: lambda qt, args, kwargs: True,
 }
 
 # Layout-specific dispatch table: {torch_op: {layout_cls: handler}}

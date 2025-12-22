@@ -68,18 +68,29 @@ pip install -e ".[dev]"
 # Skip build isolation for faster rebuilds
 pip install -e . --no-build-isolation -v
 
-# Install without CUDA backend
-pip install . --no-cuda
 ```
 
 #### Available Build Options
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--no-cuda` | Build without CUDA backend | Enabled (build with CUDA) |
-| `--cuda-archs=...` | CUDA architectures to build for | Windows: `80;89;120f`<br>Linux: `80;89;90a;100a;120f` |
-| `--debug-build` | Build in debug mode with symbols | Disabled (Release) |
-| `--lineinfo` | Enable NVCC line information for profiling | Disabled |
+These options require using `setup.py` directly (not `pip install`):
+
+| Option | Command | Description | Default |
+|--------|---------|-------------|---------|
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build without CUDA backend | Enabled (build with CUDA) |
+| `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | Windows: `80;89;120f`<br>Linux: `80;89;90a;100f;120f` |
+| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release) |
+| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled |
+
+```bash
+# Build without CUDA
+python setup.py bdist_wheel --no-cuda
+
+# Build with custom CUDA architectures
+python setup.py build_ext --cuda-archs="80;89" bdist_wheel
+
+# Debug build with line info for profiling
+python setup.py build_ext --debug-build --lineinfo bdist_wheel
+```
 
 
 

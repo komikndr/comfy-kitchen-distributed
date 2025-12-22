@@ -247,6 +247,51 @@ class TestQuantizedTensor:
         assert qt_cpu_float._qdata.device.type == "cpu"
         assert qt_cpu_float._params.orig_dtype == torch.float32
 
+    def test_to_dtype_positional_arg(self):
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+
+        qt_copy = qt.to(torch.float32, copy=True)
+
+        assert isinstance(qt_copy, QuantizedTensor)
+        assert qt_copy._qdata.dtype == torch.float8_e4m3fn
+        assert qt_copy._params.orig_dtype == torch.float32
+        assert qt_copy._qdata.data_ptr() != qt._qdata.data_ptr()
+        assert torch.equal(qt_copy._qdata, qt._qdata)
+
+    def test_to_copy_without_dtype_change(self):
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+
+        qt_copy = qt.to(copy=True)
+
+        assert isinstance(qt_copy, QuantizedTensor)
+        assert qt_copy._qdata.data_ptr() != qt._qdata.data_ptr()
+        assert torch.equal(qt_copy._qdata, qt._qdata)
+        assert qt_copy._params.orig_dtype == qt._params.orig_dtype
+
+    def test_empty_like_with_dtype_preserves_qdata_format(self):
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+
+        qt_empty = torch.empty_like(qt, dtype=torch.float32)
+
+        assert isinstance(qt_empty, QuantizedTensor)
+        assert qt_empty._qdata.dtype == torch.float8_e4m3fn
+        assert qt_empty._params.orig_dtype == torch.float32
+
+    def test_empty_like_copy_pattern_preserves_dtype(self):
+        x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
+        qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+
+        r = torch.empty_like(qt, dtype=torch.float16, device="cuda")
+        r.copy_(qt)
+
+        assert isinstance(r, QuantizedTensor)
+        assert r._qdata.dtype == torch.float8_e4m3fn
+        assert r._params.orig_dtype == torch.float16
+        assert r.dequantize().dtype == torch.float16
+
     def test_repr(self):
         x = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
         qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
@@ -414,7 +459,7 @@ class TestCopyValidation:
         qt1 = QuantizedTensor.from_float(x1, TensorCoreFP8Layout)
         qt2 = QuantizedTensor.from_float(x2, TensorCoreNVFP4Layout)
 
-        with pytest.raises(TypeError, match="Cannot copy between different layouts"):
+        with pytest.raises(TypeError, match="Layout mismatch"):
             qt1.copy_(qt2)
 
 
