@@ -112,23 +112,24 @@ set(CPP_SOURCES
 )
 
 # Create the nanobind module
+# Python 3.12+: Use stable ABI (abi3) for forward compatibility with 3.13+
+# Python 3.10/3.11: Version-specific module (nanobind stable ABI requires 3.12+)
 if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
-    nanobind_add_module(_C
-        NB_STATIC
-        STABLE_ABI
-        LTO
-        ${CPP_SOURCES}
-        ${CUDA_SOURCES}
-    )
+    message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
+    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO ${CPP_SOURCES} ${CUDA_SOURCES})
+    # Explicitly set abi3 suffix
+    if(WIN32)
+        set_target_properties(_C PROPERTIES SUFFIX ".abi3.pyd")
+    else()
+        set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
+    endif()
+    target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
 else()
-    # Python 3.10/3.11: version-specific module
-    nanobind_add_module(_C
-        NB_STATIC
-        LTO
-        ${CPP_SOURCES}
-        ${CUDA_SOURCES}
-    )
+    message(STATUS "Python ${Python_VERSION} detected - building version-specific wheel")
+    nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES} ${CUDA_SOURCES})
 endif()
+
+target_compile_definitions(_C PRIVATE NB_STATIC)
 
 # Set target properties
 target_compile_options(_C PRIVATE
@@ -180,22 +181,6 @@ if(CMAKE_CONFIGURATION_TYPES)
         RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
     )
 endif()
-
-# Set properties for ABI3 compatibility (Stable ABI) - Python 3.12+ only
-# Nanobind's stable ABI support requires Python 3.12+
-if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
-    message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
-    target_compile_definitions(_C PRIVATE
-        Py_LIMITED_API=0x030C0000
-        NB_STATIC
-    )
-else()
-    message(STATUS "Python ${Python_VERSION} detected - building version-specific wheel")
-    target_compile_definitions(_C PRIVATE
-        NB_STATIC
-    )
-endif()
-
 
 # Install target
 install(TARGETS _C
