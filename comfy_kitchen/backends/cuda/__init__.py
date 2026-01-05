@@ -43,7 +43,7 @@ try:
                     return root
         return None
 
-    nvidia_cu13_path = os.path.dirname(nvidia.cu13.__path__[0])
+    nvidia_cu13_path = nvidia.cu13.__path__[0]
 
     if sys.platform == "win32":
         lib_dir = find_lib_dir(nvidia_cu13_path, "cublasLt64")

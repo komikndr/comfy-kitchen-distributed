@@ -262,8 +262,6 @@ def quantize_nvfp4_kernel_tl(
 
             # Scale block scale to FP8
             scaled_block_scale = block_scale / per_tensor_scale
-            # Clamp to [F8_E4M3_EPS, F8_E4M3_MAX] = [0.125, 448.0]
-            scaled_block_scale = tl.maximum(scaled_block_scale, 0.125)
             scaled_block_scale = tl.minimum(scaled_block_scale, 448.0)
 
             # Round to FP8 precision
@@ -280,32 +278,13 @@ def quantize_nvfp4_kernel_tl(
             # Calculate total scale for data quantization
             scaled_block_scale_fp32 = scaled_block_scale_fp8.to(tl.float32)
             total_scale = per_tensor_scale * scaled_block_scale_fp32
-            total_scale = tl.where(total_scale < 1e-10, 1.0, total_scale)
+            zero_scale_mask = total_scale < 1e-10
+            total_scale = tl.where(zero_scale_mask, 1.0, total_scale)
 
-            # Scale and clamp data
+            # Scale data (satfinite modifier in PTX will handle clamping)
             data_scaled = x / total_scale
-            data_scaled = tl.maximum(data_scaled, -6.0)  # -F4_E2M1_MAX
-            data_scaled = tl.minimum(data_scaled, 6.0)   # F4_E2M1_MAX
+            data_scaled = tl.where(zero_scale_mask, 0.0, data_scaled)
 
-            # Quantize to FP4 values and pack - optimized version
-            # Convert all values to FP4 representation
-            sign_all = tl.where(data_scaled < 0, 1, 0)
-            abs_all = tl.abs(data_scaled)
-
-            # Map all to FP4 bit pattern (E2M1)
-            q_all = tl.where(abs_all <= 0.25, 0,
-                     tl.where(abs_all < 0.75, 1,
-                     tl.where(abs_all <= 1.25, 2,
-                     tl.where(abs_all < 1.75, 3,
-                     tl.where(abs_all <= 2.5, 4,
-                     tl.where(abs_all < 3.5, 5,
-                     tl.where(abs_all <= 5.0, 6, 7)))))))
-
-            # Add sign bits to all values
-            fp4_all = (sign_all.to(tl.int32) << 3) | q_all.to(tl.int32)
-
-            # Pack consecutive pairs of FP4 values
-            # fp4_all has 16 elements: [v0, v1, v2, v3, ..., v15]
             # We want to pack: (v0,v1), (v2,v3), ..., (v14,v15)
             pair_idx = tl.arange(0, block_size // 2)
             even_idx = pair_idx * 2
@@ -313,11 +292,27 @@ def quantize_nvfp4_kernel_tl(
 
             # Extract even and odd elements using one-hot selection
             indices = tl.arange(0, block_size)
-            fp4_even = tl.sum(tl.where(indices == even_idx[:, None], fp4_all, 0), axis=1)
-            fp4_odd = tl.sum(tl.where(indices == odd_idx[:, None], fp4_all, 0), axis=1)
+            f32_even = tl.sum(tl.where(indices == even_idx[:, None], data_scaled, 0), axis=1)
+            f32_odd = tl.sum(tl.where(indices == odd_idx[:, None], data_scaled, 0), axis=1)
 
-            # Pack two 4-bit values into one uint8
-            packed_bytes = ((fp4_even << 4) | fp4_odd).to(tl.uint8)
+            packed_bytes_u16 = tl.inline_asm_elementwise(
+                asm="""
+                {
+                    .reg .b8 fp4_byte;
+                    .reg .b16 result;
+                    cvt.rn.satfinite.e2m1x2.f32 fp4_byte, $1, $2;
+                    mov.b16 result, {fp4_byte, 0};
+                    mov.u16 $0, result;
+                }
+                """,
+                constraints="=h,f,f",
+                args=[f32_even, f32_odd],
+                dtype=tl.uint16,
+                is_pure=True,
+                pack=1,
+            )
+            # Extract the low byte
+            packed_bytes = (packed_bytes_u16 & 0xFF).to(tl.uint8)
 
             # Store packed bytes
             out_offs = pid_m * (n // 2) + pid_n * (block_size // 2) + pair_idx

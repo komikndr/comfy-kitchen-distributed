@@ -10,7 +10,6 @@ import torch
 
 from comfy_kitchen.float_utils import (
     F4_E2M1_MAX,
-    F8_E4M3_EPS,
     F8_E4M3_MAX,
     F8_E5M2_MAX,
     _f32_to_floatx_unpacked,
@@ -82,15 +81,19 @@ def quantize_nvfp4(
 
     x = x.reshape(orig_shape[0], -1, block_size)
     max_abs = torch.amax(torch.abs(x), dim=-1)
-    block_scale = max_abs / F4_E2M1_MAX
-    block_scale_fp32 = block_scale.to(torch.float32)
-    scaled_block_scales = block_scale_fp32 / per_tensor_scale
-    scaled_block_scales_fp8 = torch.clamp(scaled_block_scales, min=F8_E4M3_EPS, max=F8_E4M3_MAX)
+    block_scale = max_abs.to(torch.float32) / F4_E2M1_MAX
+    scaled_block_scales = block_scale / per_tensor_scale
+    scaled_block_scales_fp8 = torch.clamp(scaled_block_scales, max=F8_E4M3_MAX)
     scaled_block_scales_fp32 = _float8_round(scaled_block_scales_fp8)
-    # We "temporarily" dequant the scaled_block_scales_fp32 to get the per_tensor_scale
-    # To apply to data
     total_scale = per_tensor_scale * scaled_block_scales_fp32
-    data_scaled = x / total_scale.unsqueeze(-1)
+
+    # Handle zero blocks (from padding): avoid 0/0 NaN
+    zero_scale_mask = (total_scale == 0)
+    total_scale_safe = torch.where(zero_scale_mask, torch.ones_like(total_scale), total_scale)
+
+    data_scaled = x.float() / total_scale_safe.unsqueeze(-1)
+    data_scaled = torch.where(zero_scale_mask.unsqueeze(-1), torch.zeros_like(data_scaled), data_scaled)
+
     out_scales = scaled_block_scales_fp8
 
     data_scaled = torch.clamp(data_scaled, -F4_E2M1_MAX, F4_E2M1_MAX)

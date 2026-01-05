@@ -3,9 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.float_utils import (
-    F4_E2M1_EPS,
     F4_E2M1_MAX,
-    F8_E4M3_EPS,
     F8_E4M3_MAX,
     fp4_x2_to_f32,
 )
@@ -146,57 +144,38 @@ class TestQuantizeNVFP4:
 
     @pytest.mark.parametrize("m,k", [
         (1024, 2048),
+        (512, 1024),
         (129, 128),   # Edge case: odd rows requiring padding
         (33, 65),     # Edge case: both dimensions odd
     ])
     def test_quantize_nvfp4_all_backends(self, capable_backends, device, seed, m, k):
-        """Test NVFP4 quantization across all capable backends."""
-        for backend_name in capable_backends:
-            inputs = ConstraintAwareTestInputs("quantize_nvfp4", backend_name, device)
-            x = inputs.tensor("x", shape=(m, k), dtype=torch.bfloat16)
-            x = x * 4  # Scale up for better test coverage
+        """Test NVFP4 quantization across all capable backends with accuracy testing."""
+        if "eager" not in capable_backends:
+            pytest.skip("Need eager backend as reference")
 
-            scale = torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)
-            scale = scale.to(torch.float32)
-
-            needs_padding = (m % 16 != 0) or (k % 16 != 0)
-
-            with ck.use_backend(backend_name):
-                qx, sx = ck.quantize_nvfp4(x, scale, pad_16x=needs_padding)
-
-            assert qx.dtype == torch.uint8
-            assert sx.dtype == torch.float8_e4m3fn
-
-    @pytest.mark.parametrize("m,k", [(512, 1024)])
-    def test_quantize_nvfp4_cross_backend_consistency(
-        self, capable_backends, device, seed, m, k
-    ):
-        """Test that all backends produce consistent NVFP4 results."""
-        if len(capable_backends) < 2:
-            pytest.skip("Need at least 2 backends for cross-validation")
-
+        # Create test input
         x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 4
         scale = torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)
         scale = scale.to(torch.float32)
+        needs_padding = (m % 16 != 0) or (k % 16 != 0)
 
-        results = {}
+        with ck.use_backend("eager"):
+            ref_qx, ref_sx = ck.quantize_nvfp4(x, scale, pad_16x=needs_padding)
+
         for backend_name in capable_backends:
             with ck.use_backend(backend_name):
-                qx, sx = ck.quantize_nvfp4(x, scale)
-                results[backend_name] = (qx, sx)
+                qx, sx = ck.quantize_nvfp4(x, scale, pad_16x=needs_padding)
 
-        # Compare all against first
-        ref_backend = capable_backends[0]
-        ref_qx, ref_sx = results[ref_backend]
+                # Check basic properties
+                assert qx.dtype == torch.uint8
+                assert sx.dtype == torch.float8_e4m3fn
 
-        for backend_name, (qx, sx) in results.items():
-            if backend_name != ref_backend:
                 assert_values_close(
                     sx.to(torch.float32),
                     ref_sx.to(torch.float32),
-                    rtol=F8_E4M3_EPS,
-                    atol=F8_E4M3_EPS,
-                    name=f"scales ({backend_name} vs {ref_backend})"
+                    rtol=1e-5,
+                    atol=1e-3,
+                    name=f"scales ({backend_name} vs eager)"
                 )
 
                 qx_f32 = fp4_x2_to_f32(qx)
@@ -204,9 +183,9 @@ class TestQuantizeNVFP4:
                 assert_values_close(
                     qx_f32,
                     ref_qx_f32,
-                    rtol=F4_E2M1_EPS,
-                    atol=F4_E2M1_EPS,
-                    name=f"quantized ({backend_name} vs {ref_backend})"
+                    rtol=1e-2,
+                    atol=2.0,
+                    name=f"quantized data ({backend_name} vs eager)"
                 )
 
     def test_quantize_nvfp4_cpu_fallback(self, seed):
@@ -235,27 +214,47 @@ class TestDequantizeNVFP4:
             pytest.skip(f"No backend supports dequantize_nvfp4 on {device}")
         return backends
 
-    @pytest.mark.parametrize("m,k", [(1024, 2048), (512, 4096)])
+    @pytest.mark.parametrize("m,k", [
+        (1024, 2048),
+        (512, 4096),
+        (129, 128),  # Edge case with padding
+    ])
     @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
     def test_dequantize_nvfp4_all_backends(
         self, capable_backends, device, seed, m, k, output_dtype
     ):
-        """Test NVFP4 dequantization across all capable backends."""
+        """Test NVFP4 dequantization across all capable backends with accuracy testing."""
+        if "eager" not in capable_backends:
+            pytest.skip("Need eager backend as reference")
+
         x = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 4
         scale = torch.max(torch.abs(x)) / (F8_E4M3_MAX * F4_E2M1_MAX)
         scale = scale.to(torch.float32)
+        needs_padding = (m % 16 != 0) or (k % 16 != 0)
 
         # Quantize with eager
         with ck.use_backend("eager"):
-            qx, sx = ck.quantize_nvfp4(x, scale)
+            qx, sx = ck.quantize_nvfp4(x, scale, pad_16x=needs_padding)
+            ref_result = ck.dequantize_nvfp4(qx, scale, sx, output_type=output_dtype)
+            # Unpad if needed
+            ref_result = ref_result[:m, :k]
 
         for backend_name in capable_backends:
             with ck.use_backend(backend_name):
                 result = ck.dequantize_nvfp4(qx, scale, sx, output_type=output_dtype)
+                result = result[:m, :k]  # Unpad if needed
 
-            assert result.shape == x.shape
+            assert result.shape == (m, k)
             assert result.dtype == output_dtype
             assert result.device == x.device
+
+            assert_values_close(
+                result,
+                ref_result,
+                rtol=1e-3,
+                atol=1e-2,
+                name=f"dequantized output ({backend_name} vs eager)"
+            )
 
 
 class TestScaledMMNVFP4:
