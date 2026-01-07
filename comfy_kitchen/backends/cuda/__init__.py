@@ -32,7 +32,11 @@ __all__ = [
 
 _dll_handle = None
 try:
-    import nvidia.cu13
+    try:
+        import nvidia.cu13
+        nvidia_cu13_path = nvidia.cu13.__path__[0]
+    except Exception:
+        nvidia_cu13_path = torch.__path__[0]
 
     def find_lib_dir(start_dir, lib_pattern):
         for root, _dirs, files in os.walk(start_dir):
@@ -40,8 +44,6 @@ try:
                 if lib_pattern in file:
                     return root
         return None
-
-    nvidia_cu13_path = nvidia.cu13.__path__[0]
 
     if sys.platform == "win32":
         lib_dir = find_lib_dir(nvidia_cu13_path, "cublasLt64")
