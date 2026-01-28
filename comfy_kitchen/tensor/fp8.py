@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 import torch
 
 import comfy_kitchen as ck
-from comfy_kitchen.scaled_mm_v2 import scaled_mm_v2
 
 from .base import BaseLayoutParams, QuantizedLayout, dequantize_args, register_layout_op
 
@@ -91,14 +90,17 @@ def _fp8_scaled_mm(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    return scaled_mm_v2(
+    """Core FP8 scaled matrix multiplication using torch._scaled_mm."""
+    output = torch._scaled_mm(
         input_qdata.contiguous(),
         weight_qdata,
+        bias=bias,
         scale_a=scale_a,
         scale_b=scale_b,
-        bias=bias,
         out_dtype=out_dtype,
     )
+    # Handle tuple return for older PyTorch versions
+    return output[0] if isinstance(output, tuple) else output
 
 
 def _make_fp8_shape_handler(aten_op):
@@ -209,6 +211,56 @@ def _handle_fp8_addmm(qt, args, kwargs):
         return _fp8_scaled_mm(input_qdata, weight_qdata, scale_a, scale_b, bias, out_dtype)
     except (RuntimeError, TypeError):
         return torch.addmm(*dequantize_args(args))
+
+
+# ==================== Distributed Operations ====================
+
+@register_layout_op(torch.ops._c10d_functional.all_gather_into_tensor.default, TensorCoreFP8Layout)
+@register_layout_op(torch.ops.c10d_functional.all_gather_into_tensor.default, TensorCoreFP8Layout)
+def _handle_all_gather(qt, args, kwargs):
+    from .base import QuantizedTensor
+
+    input_tensor = None
+    input_idx = None
+    for i, arg in enumerate(args):
+        if isinstance(arg, QuantizedTensor):
+            input_tensor = arg
+            input_idx = i
+
+    assert input_tensor is not None
+
+    qdata = input_tensor._qdata
+    layout_cls = input_tensor._layout_cls
+    params = input_tensor._params
+
+    qdata_bytes = qdata.contiguous().view(torch.uint8)
+
+    new_args = list(args)
+    new_args[input_idx] = qdata_bytes
+
+    gathered_bytes = torch.ops._c10d_functional.all_gather_into_tensor.default(
+        *new_args, **kwargs
+    )
+
+    gathered_qdata = gathered_bytes.view(qdata.dtype)
+    return QuantizedTensor(gathered_qdata, layout_cls, params)
+
+
+@register_layout_op(torch.ops._c10d_functional.wait_tensor.default, TensorCoreFP8Layout)
+@register_layout_op(torch.ops.c10d_functional.wait_tensor.default, TensorCoreFP8Layout)
+def _handle_wait_tensor(qt, args, kwargs):
+    from .base import QuantizedTensor
+
+    qtensor = args[0]
+
+    waited_bytes = torch.ops._c10d_functional.wait_tensor.default(
+        qtensor._qdata.view(torch.uint8),
+        *args[1:],
+        **kwargs,
+    )
+
+    waited_qdata = waited_bytes.view(qtensor._qdata.dtype)
+    return QuantizedTensor(waited_qdata, qtensor._layout_cls, qtensor._params)
 
 
 # ==================== FP8 Shape Operations ====================
