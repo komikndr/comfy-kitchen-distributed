@@ -214,8 +214,8 @@ def _handle_fp8_addmm(qt, args, kwargs):
 
 
 # ==================== Distributed Operations ====================
-# Required c10d ops : c10d allgather, c10d wait
-# Required aten ops : slice, split, new_zeros, as_strided
+# Required c10d ops : c10d allgather, c10d wait, c10d broadcast (this is for broadcast_rank0=True)
+# Required aten ops : slice, split, new_zeros, as_strided, cat, alias
 
 @register_layout_op(torch.ops._c10d_functional.all_gather_into_tensor.default, TensorCoreFP8Layout)
 def _handle_all_gather(qt, args, kwargs):
@@ -265,6 +265,58 @@ def _handle_wait_tensor(qt, args, kwargs):
     return QuantizedTensor(waited_qdata, qtensor._layout_cls, waited_params)
 
 
+@register_layout_op(torch.ops.c10d.broadcast_.default, TensorCoreFP8Layout)
+def _handle_broadcast(qt, args, kwargs):
+    from .base import QuantizedTensor
+    import torch
+
+    tensor_list = args[0]
+
+    input_tensor = None
+    input_idx = None
+    for idx, t in enumerate(tensor_list):
+        if isinstance(t, QuantizedTensor):
+            input_tensor = t
+            input_idx = idx
+            break
+
+    if input_tensor is None:
+        return torch.ops.c10d.broadcast_.default(*args, **kwargs)
+
+    qdata = input_tensor._qdata.contiguous()
+    qdata_bytes = qdata.view(torch.uint8)
+
+    new_tensor_list = list(tensor_list)
+    new_tensor_list[input_idx] = qdata_bytes
+
+    new_args = list(args)
+    new_args[0] = new_tensor_list
+
+    broadcasted = torch.ops.c10d.broadcast_.default(
+        *new_args,
+        **kwargs,
+    )
+
+    if isinstance(broadcasted, tuple):
+        tensor_list_out, work = broadcasted
+    else:
+        tensor_list_out = broadcasted
+        work = None
+
+    broadcasted_qdata = tensor_list_out[input_idx].view(qdata.dtype)
+
+    new_out_list = list(tensor_list_out)
+    new_out_list[input_idx] = _wrap_fp8_tensor(
+        input_tensor,
+        broadcasted_qdata,
+    )
+
+    if work is not None:
+        return new_out_list, work
+    else:
+        return new_out_list
+
+
 def _wrap_fp8_tensor(qtensor, qdata):
     from .base import QuantizedTensor
 
@@ -304,6 +356,28 @@ def _handle_fp8_split(qt, args, kwargs):
     return wrapped_chunks
 
 
+@register_layout_op(torch.ops.aten.cat.default, TensorCoreFP8Layout)
+def _handle_fp8_cat(qt, args, kwargs):
+    from .base import QuantizedTensor
+
+    tensors = args[0]
+    if not isinstance(tensors, (list, tuple)) or not tensors:
+        return torch.ops.aten.cat.default(*args, **kwargs)
+
+    qdata_list = []
+    first_qtensor = None
+    for item in tensors:
+        if not isinstance(item, QuantizedTensor):
+            return torch.ops.aten.cat.default(*args, **kwargs)
+        qdata_list.append(item._qdata)
+        if first_qtensor is None:
+            first_qtensor = item
+
+    assert first_qtensor is not None
+    concatenated_qdata = torch.ops.aten.cat.default(qdata_list, *args[1:], **kwargs)
+    return _wrap_fp8_tensor(first_qtensor, concatenated_qdata)
+
+
 # ==================== FP8 Shape Operations ====================
 # These preserve quantization since FP8 is not packed (1:1 element mapping)
 
@@ -313,5 +387,6 @@ for _aten_op in (
     torch.ops.aten.t.default,
     torch.ops.aten.as_strided.default,
     torch.ops.aten.new_zeros.default,
+    torch.ops.aten.alias.default
 ):
     register_layout_op(_aten_op, TensorCoreFP8Layout)(_make_fp8_shape_handler(_aten_op))
