@@ -328,6 +328,62 @@ def _wrap_fp8_tensor(qtensor, qdata):
     return QuantizedTensor(qdata, qtensor._layout_cls, new_params)
 
 
+@register_layout_op(torch.ops.c10d.scatter_.default, TensorCoreFP8Layout)
+def _handle_scatter(qt, args, kwargs):
+    from .base import QuantizedTensor
+
+    output_tensors = args[0]
+    input_tensors = args[1]
+
+    quantized_outputs: list[tuple[int, QuantizedTensor]] = []
+    new_output_tensors = list(output_tensors)
+    for idx, tensor in enumerate(output_tensors):
+        if isinstance(tensor, QuantizedTensor):
+            quantized_outputs.append((idx, tensor))
+            new_output_tensors[idx] = tensor._qdata.contiguous().view(torch.uint8)
+
+    has_quantized_input = False
+    new_input_tensors: list[list[torch.Tensor]] = []
+
+    def process_input_list(entry):
+        nonlocal has_quantized_input
+        processed: list[torch.Tensor] = []
+        for t in entry:
+            if isinstance(t, QuantizedTensor):
+                has_quantized_input = True
+                processed.append(t._qdata.contiguous().view(torch.uint8))
+            else:
+                processed.append(t)
+        return processed
+
+    for entry in input_tensors:
+        if isinstance(entry, (list, tuple)):
+            new_input_tensors.append(process_input_list(entry))
+        else:
+            new_input_tensors.append(entry)  # type: ignore[arg-type]
+
+    if not quantized_outputs and not has_quantized_input:
+        return torch.ops.c10d.scatter_.default(*args, **kwargs)
+
+    new_args = [new_output_tensors, new_input_tensors, *args[2:]]
+    result = torch.ops.c10d.scatter_.default(*new_args, **kwargs)
+
+    if isinstance(result, tuple):
+        output_list, work = result
+    else:
+        output_list = result
+        work = None
+
+    output_list = list(output_list)
+    for idx, original in quantized_outputs:
+        qdata = output_list[idx].view(original._qdata.dtype)
+        output_list[idx] = _wrap_fp8_tensor(original, qdata)
+
+    if work is not None:
+        return output_list, work
+    return output_list
+
+
 @register_layout_op(torch.ops.aten.slice.Tensor, TensorCoreFP8Layout)
 def _handle_fp8_slice_tensor(qt, args, kwargs):
     from .base import QuantizedTensor
